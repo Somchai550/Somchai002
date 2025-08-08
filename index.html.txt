@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <title>AI Hair Designer (Generate)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: sans-serif; text-align:center; background:#f4f4f4; margin:0; padding:20px; }
+    h1 { margin:6px 0 8px; }
+    #face-shape-label { margin:6px 0 16px; color:#333; }
+    .camera-container { position:relative; display:inline-block; }
+    video, canvas { width:640px; height:480px; border-radius:8px; background:#000; display:block; }
+    #output { position:absolute; top:0; left:0; pointer-events:none; }
+    .controls { margin-top:14px; display:flex; gap:12px; justify-content:center; flex-wrap:wrap; }
+    .hair-list { margin-top:16px; display:flex; gap:12px; justify-content:center; flex-wrap:wrap; }
+    .hair-card { width:120px; border-radius:8px; padding:6px; background:#fff; box-shadow:0 2px 6px rgba(0,0,0,.08); cursor:pointer; text-align:center; }
+    .hair-card img { width:100%; height:96px; object-fit:contain; background:transparent; display:block; }
+    .btn { padding:8px 12px; border-radius:6px; border:0; background:#007bff; color:#fff; cursor:pointer; }
+    .muted { color:#666; font-size:13px; }
+    #loading { display:none; color:#007bff; }
+  </style>
+</head>
+<body>
+  <h1>AI Hair Designer (Gen 3 Styles)</h1>
+  <div id="face-shape-label">กำลังวิเคราะห์รูปหน้า...</div>
+
+  <div class="camera-container">
+    <video id="cam" autoplay playsinline></video>
+    <canvas id="output"></canvas>
+  </div>
+
+  <div class="controls">
+    <button id="regenerate" class="btn">สร้าง 3 แบบใหม่</button>
+    <div id="loading">กำลังสร้างรูป... (อาจใช้เวลาหลายวินาที)</div>
+  </div>
+
+  <div class="muted">คลิกที่รูปเพื่อเลือกทรงผมแล้วมันจะติดที่หัว</div>
+  <div class="hair-list" id="hair-list"></div>
+
+  <!-- MediaPipe libs -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+  <script>
+  /* ========== CONFIG ========== */
+  // ชี้ไปยังเซิร์ฟเวอร์ที่ทำหน้าที่เรียก Image API (ต้องตั้งค่าเอง)
+  const API_BASE = "" /* ตัวอย่าง: "https://my-server.example.com" */;
+  const API_GENERATE_ENDPOINT = "/api/generate-hair"; // POST { prompt }
+  /* ============================ */
+
+  const video = document.getElementById('cam');
+  const canvas = document.getElementById('output');
+  const ctx = canvas.getContext('2d');
+  const faceShapeLabel = document.getElementById('face-shape-label');
+  const hairListEl = document.getElementById('hair-list');
+  const regenerateBtn = document.getElementById('regenerate');
+  const loadingEl = document.getElementById('loading');
+
+  canvas.width = 640; canvas.height = 480;
+
+  let selectedHairImg = null;
+  let lastDetectedShape = null;
+  let generating = false;
+  let generatedImages = []; // [{url, prompt, name}]
+
+  function detectFaceShape(lm) {
+    // ใช้ค่า landmarks พื้นฐาน (ค่าเป็น normalized coordinates)
+    const jawLeft = lm[234], jawRight = lm[454];
+    const chin = lm[152], forehead = lm[10];
+    const cheekLeft = lm[123], cheekRight = lm[352];
+
+    const faceWidth = Math.hypot((jawLeft.x - jawRight.x), (jawLeft.y - jawRight.y));
+    const faceHeight = Math.hypot((chin.x - forehead.x), (chin.y - forehead.y));
+    const cheekWidth = Math.hypot((cheekLeft.x - cheekRight.x), (cheekLeft.y - cheekRight.y));
+    const ratio = faceHeight / faceWidth;
+
+    if (ratio > 1.5) return "Oval";
+    if (Math.abs(faceWidth - cheekWidth) < 0.02 && ratio < 1.4) return "Square";
+    if (ratio < 1.3 && cheekWidth / faceWidth > 0.9) return "Round";
+    // heuristic for heart: wider forehead (forehead y is smaller)
+    if (cheekWidth < faceWidth * 0.85 && forehead.y < cheekLeft.y) return "Heart";
+    return "Diamond";
+  }
+
+  function getPromptsForShape(shape) {
+    // ปรับ prompt ได้ตามต้องการ — เราสร้าง 3 แบบ (long/medium/short)
+    const templates = [
+      `realistic transparent-background PNG of a flattering long hairstyle for a ${shape} face, high detail, front view, clean hair edges, no body, isolated`,
+      `realistic transparent-background PNG of a flattering medium-length layered hairstyle for a ${shape} face, high detail, front view, clean hair edges, no body, isolated`,
+      `realistic transparent-background PNG of a trendy short haircut for a ${shape} face, high detail, front view, clean hair edges, no body, isolated`
+    ];
+    return templates;
+  }
+
+  async function generateThreeStyles(shape) {
+    if (!API_BASE) {
+      alert("ยังไม่ได้ตั้งค่า API_BASE ในโค้ด (ชี้ไปที่เซิร์ฟเวอร์ของคุณ)"); 
+      return [];
+    }
+    const prompts = getPromptsForShape(shape);
+    loadingEl.style.display = "inline";
+    generating = true;
+    generatedImages = [];
+    try {
+      for (let i=0;i<prompts.length;i++){
+        const prompt = prompts[i];
+        // เรียกเซิร์ฟเวอร์ของเรา (เซิร์ฟเวอร์จะมี API_KEY และติดต่อกับ Image API จริง)
+        const res = await fetch(API_BASE + API_GENERATE_ENDPOINT, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt })
+        });
+        if (!res.ok) {
+          const txt = await res.text();
+          throw new Error('Server error: ' + txt);
+        }
+        const j = await res.json();
+        // server ควรตอบ { image_url: "...", prompt: "...", name: "..." } หรือ base64
+        generatedImages.push({ url: j.image_url || j.base64, prompt, name: j.name || `ทรง ${i+1}` });
+      }
+      return generatedImages;
+    } finally {
+      loadingEl.style.display = "none";
+      generating = false;
+    }
+  }
+
+  function renderGeneratedList(list) {
+    hairListEl.innerHTML = "";
+    list.forEach((item, idx) => {
+      const card = document.createElement('div');
+      card.className = 'hair-card';
+      const img = document.createElement('img');
+      // ถ้า server ส่ง base64 (data:image/png;base64,...) ก็ใช้ได้ทั้งสองแบบ
+      img.src = item.url;
+      const span = document.createElement('div');
+      span.textContent = item.name || `ทรง ${idx+1}`;
+      card.appendChild(img);
+      card.appendChild(span);
+      card.addEventListener('click', () => {
+        // เลือกทรง — สร้าง Image object สำหรับ overlay
+        selectedHairImg = new Image();
+        selectedHairImg.src = item.url;
+      });
+      hairListEl.appendChild(card);
+    });
+  }
+
+  // FaceMesh setup
+  const faceMesh = new FaceMesh({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+  });
+  faceMesh.setOptions({ maxNumFaces:1, refineLandmarks:true, minDetectionConfidence:0.5, minTrackingConfidence:0.5 });
+
+  faceMesh.onResults(async (results) => {
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.drawImage(results.image, 0, 0, canvas.width, canvas.height);
+
+    if (results.multiFaceLandmarks && results.multiFaceLandmarks[0]) {
+      const lm = results.multiFaceLandmarks[0];
+      // วิเคราะห์รูปหน้า (อัปเดตเมื่อรูปหน้าเปลี่ยน)
+      const shape = detectFaceShape(lm);
+      if (shape !== lastDetectedShape && !generating) {
+        lastDetectedShape = shape;
+        faceShapeLabel.textContent = `รูปหน้าคุณ: ${shape} — สร้าง 3 ทรงที่เหมาะสม...`;
+        // สร้าง 3 รูปใหม่ (เรียกเซิร์ฟเวอร์)
+        try {
+          const list = await generateThreeStyles(shape);
+          renderGeneratedList(list);
+          faceShapeLabel.textContent = `รูปหน้าคุณ: ${shape} — เลือกทรงผมจากด้านล่าง`;
+        } catch (e) {
+          console.error(e);
+          faceShapeLabel.textContent = `รูปหน้าคุณ: ${shape} — เกิดข้อผิดพลาดขณะสร้างภาพ`;
+        }
+      }
+
+      // ถ้ามีทรงผมถูกเลือก ให้ overlay บนหัว
+      if (selectedHairImg && selectedHairImg.complete) {
+        // ตำแหน่งและมุม (เหมือนโค้ดก่อนหน้า)
+        const jawLeft = lm[234], jawRight = lm[454];
+        const widthPx = Math.hypot((jawLeft.x - jawRight.x)*canvas.width, (jawLeft.y - jawRight.y)*canvas.height);
+
+        const leftForehead = lm[10], rightForehead = lm[152];
+        const midX = (leftForehead.x + rightForehead.x)/2 * canvas.width;
+        const midY = (leftForehead.y + rightForehead.y)/2 * canvas.height;
+
+        const leftEye = lm[33], rightEye = lm[263];
+        const angle = Math.atan2((rightEye.y - leftEye.y), (rightEye.x - leftEye.x));
+
+        const w = widthPx * 1.5;
+        const h = w * (selectedHairImg.height / selectedHairImg.width || 0.8);
+
+        ctx.save();
+        ctx.translate(midX, midY - h*0.5);
+        ctx.rotate(angle);
+        ctx.drawImage(selectedHairImg, -w/2, -h/2, w, h);
+        ctx.restore();
+      }
+    } else {
+      faceShapeLabel.textContent = "ไม่พบใบหน้า — กรุณาให้กล้องเห็นใบหน้าชัดเจน";
+    }
+  });
+
+  // เปิดกล้อง
+  const camera = new Camera(video, {
+    onFrame: async () => { await faceMesh.send({ image: video }); },
+    width:640, height:480
+  });
+  camera.start();
+
+  // ปุ่มสร้างใหม่ (ถ้าต้องการ)
+  regenerateBtn.addEventListener('click', async () => {
+    if (!lastDetectedShape || generating) return;
+    faceShapeLabel.textContent = `สร้าง 3 ทรงใหม่สำหรับ ${lastDetectedShape}...`;
+    try {
+      const list = await generateThreeStyles(lastDetectedShape);
+      renderGeneratedList(list);
+      faceShapeLabel.textContent = `สร้างเสร็จ — เลือกทรงผม`;
+    } catch (e) {
+      faceShapeLabel.textContent = `สร้างรูปไม่สำเร็จ`;
+      console.error(e);
+    }
+  });
+
+  </script>
+</body>
+</html>
